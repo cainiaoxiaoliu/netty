@@ -17,6 +17,7 @@
 package io.netty.handler.codec.compression;
 
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandlerContext;
@@ -30,6 +31,7 @@ import net.jpountz.lz4.LZ4Exception;
 import net.jpountz.lz4.LZ4Factory;
 import net.jpountz.xxhash.XXHashFactory;
 
+import java.nio.ByteBuffer;
 import java.util.concurrent.TimeUnit;
 import java.util.zip.Checksum;
 
@@ -70,7 +72,7 @@ public class Lz4FrameEncoder extends MessageToByteEncoder<ByteBuf> {
     /**
      * Inner byte buffer for outgoing data.
      */
-    private byte[] buffer;
+    private ByteBuf buffer;
 
     /**
      * Current length of buffered bytes in {@link #buffer}.
@@ -117,7 +119,7 @@ public class Lz4FrameEncoder extends MessageToByteEncoder<ByteBuf> {
     /**
      * Creates a new customizable LZ4 encoder.
      *
-     * @param factory         user customizable {@link net.jpountz.lz4.LZ4Factory} instance
+     * @param factory         user customizable {@link LZ4Factory} instance
      *                        which may be JNI bindings to the original C implementation, a pure Java implementation
      *                        or a Java implementation that uses the {@link sun.misc.Unsafe}
      * @param highCompressor  if {@code true} codec will use compressor which requires more memory
@@ -127,7 +129,6 @@ public class Lz4FrameEncoder extends MessageToByteEncoder<ByteBuf> {
      * @param checksum        the {@link Checksum} instance to use to check data for integrity
      */
     public Lz4FrameEncoder(LZ4Factory factory, boolean highCompressor, int blockSize, Checksum checksum) {
-        super(false);
         if (factory == null) {
             throw new NullPointerException("factory");
         }
@@ -139,7 +140,8 @@ public class Lz4FrameEncoder extends MessageToByteEncoder<ByteBuf> {
         this.checksum = checksum;
 
         compressionLevel = compressionLevel(blockSize);
-        buffer = new byte[blockSize];
+        // Ensure we use a heap based ByteBuffer.
+        buffer = Unpooled.wrappedBuffer(new byte[blockSize]);
         currentBlockLength = 0;
         compressedBlockSize = HEADER_LENGTH + compressor.maxCompressedLength(blockSize);
 
@@ -168,8 +170,8 @@ public class Lz4FrameEncoder extends MessageToByteEncoder<ByteBuf> {
 
         int length = in.readableBytes();
 
-        final byte[] buffer = this.buffer;
-        final int blockSize = buffer.length;
+        final ByteBuf buffer = this.buffer;
+        final int blockSize = buffer.capacity();
         while (currentBlockLength + length >= blockSize) {
             final int tail = blockSize - currentBlockLength;
             in.getBytes(in.readerIndex(), buffer, currentBlockLength, tail);
@@ -188,16 +190,18 @@ public class Lz4FrameEncoder extends MessageToByteEncoder<ByteBuf> {
             return;
         }
         checksum.reset();
-        checksum.update(buffer, 0, currentBlockLength);
+        checksum.update(buffer.array(), buffer.arrayOffset(), currentBlockLength);
         final int check = (int) checksum.getValue();
 
         out.ensureWritable(compressedBlockSize);
         final int idx = out.writerIndex();
-        final byte[] dest = out.array();
-        final int destOff = out.arrayOffset() + idx;
         int compressedLength;
         try {
-            compressedLength = compressor.compress(buffer, 0, currentBlockLength, dest, destOff + HEADER_LENGTH);
+            ByteBuffer outNioBuffer = out.internalNioBuffer(idx + HEADER_LENGTH, out.writableBytes() - HEADER_LENGTH);
+            int pos = outNioBuffer.position();
+            // We always want to start at position 0 as we take care of reusing the buffer in the encode(...) loop.
+            compressor.compress(buffer.internalNioBuffer(0, currentBlockLength), outNioBuffer);
+            compressedLength = outNioBuffer.position() - pos;
         } catch (LZ4Exception e) {
             throw new CompressionException(e);
         }
@@ -205,16 +209,16 @@ public class Lz4FrameEncoder extends MessageToByteEncoder<ByteBuf> {
         if (compressedLength >= currentBlockLength) {
             blockType = BLOCK_TYPE_NON_COMPRESSED;
             compressedLength = currentBlockLength;
-            System.arraycopy(buffer, 0, dest, destOff + HEADER_LENGTH, currentBlockLength);
+            out.setBytes(idx + HEADER_LENGTH, buffer, 0, currentBlockLength);
         } else {
             blockType = BLOCK_TYPE_COMPRESSED;
         }
 
         out.setLong(idx, MAGIC_NUMBER);
-        dest[destOff + TOKEN_OFFSET] = (byte) (blockType | compressionLevel);
-        writeIntLE(compressedLength, dest, destOff + COMPRESSED_LENGTH_OFFSET);
-        writeIntLE(currentBlockLength, dest, destOff + DECOMPRESSED_LENGTH_OFFSET);
-        writeIntLE(check, dest, destOff + CHECKSUM_OFFSET);
+        out.setByte(idx + TOKEN_OFFSET, (byte) (blockType | compressionLevel));
+        out.setIntLE(idx + COMPRESSED_LENGTH_OFFSET, compressedLength);
+        out.setIntLE(idx + DECOMPRESSED_LENGTH_OFFSET, currentBlockLength);
+        out.setIntLE(idx + CHECKSUM_OFFSET, check);
         out.writerIndex(idx + HEADER_LENGTH + compressedLength);
         currentBlockLength = 0;
 
@@ -233,30 +237,22 @@ public class Lz4FrameEncoder extends MessageToByteEncoder<ByteBuf> {
         flushBufferedData(footer);
 
         final int idx = footer.writerIndex();
-        final byte[] dest = footer.array();
-        final int destOff = footer.arrayOffset() + idx;
         footer.setLong(idx, MAGIC_NUMBER);
-        dest[destOff + TOKEN_OFFSET] = (byte) (BLOCK_TYPE_NON_COMPRESSED | compressionLevel);
-        writeIntLE(0, dest, destOff + COMPRESSED_LENGTH_OFFSET);
-        writeIntLE(0, dest, destOff + DECOMPRESSED_LENGTH_OFFSET);
-        writeIntLE(0, dest, destOff + CHECKSUM_OFFSET);
+        footer.setByte(idx + TOKEN_OFFSET, (byte) (BLOCK_TYPE_NON_COMPRESSED | compressionLevel));
+        footer.setIntLE(idx + COMPRESSED_LENGTH_OFFSET, 0);
+        footer.setIntLE(idx + DECOMPRESSED_LENGTH_OFFSET, 0);
+        footer.setIntLE(idx + CHECKSUM_OFFSET, 0);
+
         footer.writerIndex(idx + HEADER_LENGTH);
 
         compressor = null;
         checksum = null;
-        buffer = null;
+        if (buffer != null) {
+            buffer.release();
+            buffer = null;
+        }
 
         return ctx.writeAndFlush(footer, promise);
-    }
-
-    /**
-     * Writes {@code int} value into the byte buffer with little-endian format.
-     */
-    private static void writeIntLE(int i, byte[] buf, int off) {
-        buf[off++] = (byte) i;
-        buf[off++] = (byte) (i >>> 8);
-        buf[off++] = (byte) (i >>> 16);
-        buf[off]   = (byte) (i >>> 24);
     }
 
     /**
